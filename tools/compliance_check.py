@@ -43,6 +43,7 @@ ALLOWED_LICENSES = {"Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", 
 UPSTREAM_RELEASE = "3cccbf602077a846c13b2cb1356eee1559a631db"
 
 RESULTS: list[tuple[str, str, str, str]] = []   # (group, id, status, detail)
+VERIFY_REBUILD = False
 
 
 def rec(group: str, cid: str, ok, detail: str, rule: str = "") -> None:
@@ -203,6 +204,28 @@ def group_b(image: str | None, meta: dict) -> bool:
                 rec("B", "B6", None, "익명 토큰 발급 실패 — 공개 여부 미확인")
     rec("B", "B4", layers_ok, layer_note,
         "RUNTIME.md: OCI 압축 계층 합계 1 GiB")
+
+    if VERIFY_REBUILD:
+        # The strongest available evidence for two separate rules: the image can
+        # be rebuilt from the submitted commit, and the commit corresponds to the
+        # immutable digest. Requires a clean tree to mean anything.
+        tag = "ossp-compliance-rebuild:check"
+        b = sh(["docker", "build", "--pull", "--platform", "linux/arm64",
+                "--provenance=false", "--sbom=false", "--file",
+                str(ROOT / "container" / "Dockerfile"), "--tag", tag, str(ROOT)],
+               timeout=1800)
+        if b.returncode != 0:
+            rec("B", "B7", False, f"재빌드 실패: {b.stderr.strip()[-200:]}")
+        else:
+            got = sh(["docker", "image", "inspect", tag, "--format", "{{.Id}}"]).stdout.strip()
+            want = dig.split("@")[1] if "@sha256:" in dig else ""
+            rec("B", "B7", got == want,
+                f"현재 커밋에서 재빌드한 다이제스트가 제출본과 일치 "
+                f"({got[:19]} vs {want[:19]})",
+                "CHALLENGE_RULES.md: 제출한 커밋에서 이미지를 재현 가능하게 빌드")
+            sh(["docker", "image", "rm", "-f", tag])
+    else:
+        rec("B", "B7", None, "재빌드 검증 생략 (--verify-rebuild 로 활성화)")
     return True
 
 
@@ -470,7 +493,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--image")
     ap.add_argument("--skip-runtime", action="store_true")
+    ap.add_argument("--verify-rebuild", action="store_true",
+                    help="현재 커밋에서 이미지를 재빌드해 제출 다이제스트와 비교 (수 분)")
     args = ap.parse_args()
+    global VERIFY_REBUILD
+    VERIFY_REBUILD = args.verify_rebuild
 
     print("=" * 78)
     print("SKT OSSP 2026 제출 규격 준수 하네스")
