@@ -191,6 +191,33 @@ class LpbRouterTest(unittest.TestCase):
             for prev, cur in zip(ladder, ladder[1:]):
                 self.assertLessEqual(costs[prev], costs[cur], text[:40])
 
+    def test_cost_calibration_is_present_and_conservative(self):
+        """Smearing alone left axk1-think ~20% under out of fold.
+
+        The correction must exist, must not be a no-op for the think model, and
+        must never make a model look *cheaper* than the raw fit predicted -- a
+        factor below 1 would mean the router plans to spend more than it
+        measured, which is the wrong direction for a hard budget.
+        """
+        calib = self.artifact.cost_calib
+        self.assertEqual(len(calib), len(self.artifact.models))
+        for c in calib:
+            self.assertGreaterEqual(c, 1.0)
+            self.assertLess(c, 3.0)
+        think = self.artifact.models.index("axk1-think")
+        self.assertGreater(calib[think], 1.05)
+
+    def test_tier_margins_leave_headroom(self):
+        """Every tier must plan below its limit, not at it.
+
+        The operator's own hash-regex baseline sat at 98-100% of all three
+        limits on public Dev and lost Premium on the grading set.
+        """
+        for tier in TIERS:
+            excess = self.artifact.tier_excess[tier]
+            self.assertGreater(excess, 0.0)
+            self.assertLessEqual(excess, 0.95)
+
     def test_degenerate_prompts_do_not_route_to_the_think_model_at_fast(self):
         """A batch of junk must not spend the Fast budget on the 22x model."""
         batch = parse_input(

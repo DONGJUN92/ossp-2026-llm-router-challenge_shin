@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from decimal import Decimal
 from pathlib import Path
@@ -353,6 +354,121 @@ def grouped_folds(texts: Sequence[str], k: int, seed: int) -> List[List[int]]:
     return [sorted(f) for f in folds]
 
 
+_HANGUL = re.compile(r"[가-힣]")
+_MCQ_OPT = re.compile(r"\n\s*[A-D][.)]\s")
+_RULE = re.compile(r"\b(visits|chases|eats|sees|likes)\b", re.I)
+_CRUX = re.compile(r"def f\(|assert f\(")
+_DMM = re.compile(
+    r"(Let [a-z]\w*\(?[a-z]?\)? = |Solve |Differentiate |Calculate |Simplify |"
+    r"Factor |Suppose |What is the [a-z]+ derivative|Round |Sort |Divide |Work out )"
+)
+
+
+def coarse_family(text: str) -> str:
+    """Approximate source family, for offline resampling only.
+
+    `DATA_LICENSES.md` names eleven public source families and the private
+    mixture over them is deliberately undisclosed. Composition risk lives at
+    this granularity, not at the template level: a Dirichlet over the ~1,500
+    template signatures is numerically indistinguishable from a plain bootstrap
+    and reports a 0% breach rate for margins that in fact breach one time in ten.
+
+    This label never reaches the router. It is computed here, in the trainer,
+    purely to redraw the family mixture when sizing a margin.
+    """
+    if _HANGUL.search(text):
+        return "ko-mcq" if ("Question:" in text or _MCQ_OPT.search(text)) else "ko-reasoning"
+    if _CRUX.search(text):
+        return "code-exec"
+    if len(text) > 4000:
+        return "long-context"
+    if _RULE.search(text[:400]) and "If someone" in text:
+        return "rule-logic"
+    if text.lstrip().startswith("Question:") and _MCQ_OPT.search(text):
+        return "en-mcq"
+    if _DMM.search(text[:400]) and len(text) < 800:
+        return "symbolic-math"
+    if len(text) < 1200 and re.search(r"how (many|much)|total|\$|calculate", text, re.I):
+        return "word-math"
+    return "unclassified"
+
+
+def _template_groups(texts: Sequence[str]) -> List[List[int]]:
+    """Index lists per coarse source family."""
+    groups: Dict[str, List[int]] = {}
+    for i, t in enumerate(texts):
+        groups.setdefault(coarse_family(t), []).append(i)
+    return [groups[k] for k in sorted(groups)]
+
+
+def breach_rate_under_shift(
+    texts, P, C, TRUE_C, policy, tier, excess, groups, *,
+    worlds: int = 40, concentration: float = 4.0, seed: int = 0,
+) -> float:
+    """Fraction of resampled compositions where this margin exceeds the limit.
+
+    The out-of-fold ratio answers "what would this margin have spent on public
+    Train". It cannot answer "what will it spend on a set whose mixture nobody
+    has disclosed", and `docs/DATA_CARD.md` says that mixture is not disclosed.
+    Each world here redraws the weight of every template group from a Dirichlet
+    and resamples episodes under it, so a margin that only survives the public
+    proportions is visibly unsafe rather than silently so.
+    """
+    rng = np.random.default_rng(seed)
+    limit = float(policy.tiers[tier].budget_multiplier)
+    li = MODELS.index(policy.light_model_id)
+    n = len(texts)
+    # alpha proportional to the observed share, scaled by concentration: small
+    # concentration allows a private set dominated by one family, large keeps it
+    # near the public proportions.
+    base = np.asarray([len(g) for g in groups], dtype=float)
+    alpha = concentration * len(groups) * base / base.sum()
+    breaches = 0
+    for _ in range(worlds):
+        w = rng.dirichlet(alpha)
+        counts = rng.multinomial(n, w)
+        idx = np.concatenate(
+            [rng.choice(groups[g], size=c, replace=True) for g, c in enumerate(counts) if c]
+        )
+        sub_texts = [texts[i] for i in idx]
+        picks = route(sub_texts, P[idx], C[idx], tier, policy, excess)
+        chosen = [MODELS.index(m) for m in picks]
+        spend = sum(TRUE_C[idx[t], chosen[t]] for t in range(len(idx)))
+        base = float(TRUE_C[idx, li].sum())
+        if base > 0 and spend / base > limit:
+            breaches += 1
+    return breaches / worlds
+
+
+def _oof_predictions(X, Y, TIN, TOUT, texts, policy, args, k, seed, use_grm):
+    """Held-out score and cost predictions over one grouped K-fold partition."""
+    n = len(texts)
+    P = np.zeros_like(Y)
+    C = np.zeros_like(Y)
+    for f in grouped_folds(texts, k, seed):
+        hold = np.asarray(f)
+        rest = np.asarray([i for i in range(n) if i not in set(f)])
+        Win, sin_ = fit_tokens(X[rest], TIN[rest], args.alpha)
+        Wout, sout = fit_tokens(X[rest], TOUT[rest], args.alpha)
+        if use_grm:
+            values = np.unique(Y[rest])
+            a_i, thr_i = fit_grm_items(Y[rest], values)
+            Wmu_i, Ws_i = fit_grm_heads(X[rest], Y[rest], a_i, thr_i, values)
+            P[hold] = grm_expected(X[hold], Wmu_i, Ws_i, a_i, thr_i, values)[0]
+        else:
+            w_i, a_i, b_i = fit_2pl(X[rest], Y[rest], l2=args.alpha)
+            th = X[hold] @ w_i
+            P[hold] = 1.0 / (1.0 + np.exp(
+                -np.clip(a_i[None, :] * (th[:, None] - b_i[None, :]), -30, 30)))
+        rin, rout = token_ranges(TIN[rest]), token_ranges(TOUT[rest])
+        for j in range(len(MODELS)):
+            tin = np.clip(np.exp(np.minimum(X[hold] @ Win[j], 20)) * sin_[j], *rin[j])
+            tout = np.clip(np.exp(np.minimum(X[hold] @ Wout[j], 20)) * sout[j], *rout[j])
+            C[hold, j] = [cost_of(policy, MODELS[j], tin[t], tout[t])
+                          for t in range(len(hold))]
+    return P, C
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--train-input", type=Path, required=True)
@@ -362,8 +478,20 @@ def main() -> int:
     ap.add_argument("--dim", type=int, default=512)
     ap.add_argument("--alpha", type=float, default=3.0)
     ap.add_argument("--folds", type=int, default=5)
+    ap.add_argument("--margin-folds", type=int, default=12,
+                    help="마진 산정용 fold 수. 배포 모델은 Train 전체로 적합되므로 "
+                         "fold 수가 적으면 배포보다 나쁜 예측기로 마진을 재게 된다")
+    ap.add_argument("--margin-repeats", type=int, default=2,
+                    help="마진 산정 교차검증 반복 수 (분할 잡음 완화)")
     ap.add_argument("--target-headroom", type=float, default=0.90,
                     help="out-of-fold 실현 비율이 한도의 이 비율을 넘지 않도록 마진을 정한다")
+    ap.add_argument("--shift-worlds", type=int, default=60,
+                    help="마진 산정 시 혼합비를 다시 뽑아 볼 가상 평가셋 수")
+    ap.add_argument("--shift-concentration", type=float, default=2.0,
+                    help="작을수록 혼합비가 크게 흔들린다. Train 계열 재추출만으로는 "
+                         "Train→비공개셋 이동을 다 담지 못하므로 보수적으로 잡는다")
+    ap.add_argument("--max-breach", type=float, default=0.02,
+                    help="혼합비 변화 하에서 허용할 예산 초과 확률 상한")
     ap.add_argument("--predictor", choices=("2pl", "grm"), default="2pl",
                     help="grm 은 측정 후 기각된 대안이다 (fit_grm_items docstring 참조)")
     args = ap.parse_args()
@@ -387,40 +515,44 @@ def main() -> int:
     print(f"design matrix = {X.shape}")
 
     # ---- out-of-fold predictions, used for margin sizing only ----------------
-    folds = grouped_folds(texts, args.folds, 0)
-    P_oof = np.zeros_like(Y)
-    C_oof = np.zeros_like(TRUE_C)
-    for f in folds:
-        hold = np.asarray(f)
-        rest = np.asarray([i for i in range(n) if i not in set(f)])
-        Win, sin_ = fit_tokens(X[rest], TIN[rest], args.alpha)
-        Wout, sout = fit_tokens(X[rest], TOUT[rest], args.alpha)
-        if use_grm:
-            values = np.unique(Y[rest])
-            a_i, thr_i = fit_grm_items(Y[rest], values)
-            Wmu_i, Ws_i = fit_grm_heads(X[rest], Y[rest], a_i, thr_i, values)
-            P_oof[hold] = grm_expected(X[hold], Wmu_i, Ws_i, a_i, thr_i, values)[0]
-        else:
-            w_i, a_i, b_i = fit_2pl(X[rest], Y[rest], l2=args.alpha)
-            th = X[hold] @ w_i
-            P_oof[hold] = 1.0 / (1.0 + np.exp(
-                -np.clip(a_i[None, :] * (th[:, None] - b_i[None, :]), -30, 30)))
-        rin = token_ranges(TIN[rest])
-        rout = token_ranges(TOUT[rest])
-        for j in range(3):
-            tin = np.clip(np.exp(np.minimum(X[hold] @ Win[j], 20)) * sin_[j], *rin[j])
-            tout = np.clip(np.exp(np.minimum(X[hold] @ Wout[j], 20)) * sout[j], *rout[j])
-            C_oof[hold, j] = [cost_of(policy, MODELS[j], tin[t], tout[t])
-                              for t in range(len(hold))]
-
+    #
+    # Fold count matters more here than it looks. The shipped predictor is fitted
+    # on all of Train; a fold model fitted on 80% is measurably noisier, and a
+    # noisier score model buys worse upgrades. Because axk1-think costs ~22x the
+    # light baseline, those bad buys are expensive: at the same margin, 5-fold
+    # out-of-fold predictions spent ratio 3.29 on Train where the shipped model
+    # spent 2.37 on the same episodes. Sizing the margin against that gap left
+    # Premium using 2.66 of a 4.0 budget. More folds move the calibration model
+    # closer to what actually ships; repeats average out the partition draw.
+    # Each repeat is kept as its own prediction set. Averaging them would
+    # denoise the predictor beyond anything that ships, and the whole point of
+    # this step is to size a margin against the noise level that actually
+    # deploys -- an averaged set reported a 0% breach rate for margins the
+    # independent harness measured at 10-12%.
+    reps = max(1, args.margin_repeats)
+    oof_sets = [
+        _oof_predictions(X, Y, TIN, TOUT, texts, policy, args,
+                         args.margin_folds, seed=rep, use_grm=use_grm)
+        for rep in range(reps)
+    ]
+    P_oof, C_oof = oof_sets[0]
     li = MODELS.index(policy.light_model_id)
     true_base = float(TRUE_C[:, li].sum())
-    print("\nout-of-fold cost model check")
+    print("\nout-of-fold cost model check (before calibration)")
+    cost_calib = []
     for j, m in enumerate(MODELS):
-        print(f"  {m:11s} predicted/actual total cost = "
-              f"{C_oof[:, j].sum() / TRUE_C[:, j].sum():.4f}")
+        ratio = float(C_oof[:, j].sum() / TRUE_C[:, j].sum())
+        cost_calib.append(1.0 / ratio if ratio > 0 else 1.0)
+        print(f"  {m:11s} predicted/actual = {ratio:.4f}  -> calibration x{cost_calib[-1]:.4f}")
+    # Apply the correction to every out-of-fold cost set too, so the margin
+    # sweep below sees the same cost scale the runtime will use.
+    calib_arr = np.asarray(cost_calib)[None, :]
+    calib_ones = np.ones((1, len(MODELS)))
+    C_oof = C_oof * calib_arr
 
     # ---- size each tier's margin on out-of-fold realised ratio ---------------
+    groups = _template_groups(texts)
+    print(f"\ntemplate groups for shift resampling = {len(groups)}")
     tier_excess: Dict[str, float] = {}
     margin_report = {}
     for tier in TIERS:
@@ -431,11 +563,25 @@ def main() -> int:
             picks = route(texts, P_oof, C_oof, tier, policy, cand)
             realised = sum(TRUE_C[i, MODELS.index(picks[i])] for i in range(n)) / true_base
             quality = float(np.mean([Y[i, MODELS.index(picks[i])] for i in range(n)]))
-            rows_t.append({"excess": cand, "realised_ratio": realised, "oof_quality": quality})
-            # Take the largest margin whose whole prefix is still under target.
-            # Scanning for the maximum passing candidate would step over a
-            # failing region and ship a margin that is only safe by accident.
-            if realised > target:
+            # worst repeat, not the mean: a margin is only safe if it holds for
+            # every prediction set we drew, not on average across them
+            breach = max(
+                breach_rate_under_shift(
+                    texts, Pr * calib_ones, Cr * calib_arr, TRUE_C, policy, tier,
+                    cand, groups, worlds=args.shift_worlds,
+                    concentration=args.shift_concentration, seed=17 + r,
+                )
+                for r, (Pr, Cr) in enumerate(oof_sets)
+            )
+            rows_t.append({"excess": cand, "realised_ratio": realised,
+                           "oof_quality": quality, "shift_breach": breach})
+            # Two conditions, both on Train only. The point estimate keeps the
+            # margin under the limit on the public mixture; the shift breach
+            # rate keeps it under the limit on mixtures nobody has shown us.
+            # Take the largest margin whose whole prefix passes: scanning for
+            # the maximum passing candidate would step over a failing region
+            # and ship a margin that is only safe by accident.
+            if realised > target or breach > args.max_breach:
                 break
             chosen = cand
         tier_excess[tier] = chosen
@@ -444,6 +590,7 @@ def main() -> int:
                                "sweep": rows_t}
         print(f"  {tier:9s} limit {limit_mult:.2f}  target <= {target:.3f}  "
               f"chosen excess {chosen:.2f}  oof realised {best['realised_ratio']:.3f}  "
+              f"shift breach {best['shift_breach']:.1%}  "
               f"oof quality {best['oof_quality']:.4f}")
 
     # ---- final fit on all of Train ------------------------------------------
@@ -486,6 +633,7 @@ def main() -> int:
         "out_smear": [float(v) for v in sout],
         "in_range": [[lo, hi] for lo, hi in token_ranges(TIN)],
         "out_range": [[lo, hi] for lo, hi in token_ranges(TOUT)],
+        "cost_calib": [float(v) for v in cost_calib],
         "tier_excess": tier_excess,
         "train_episodes": n,
         "notes": "fitted from public Train only; margins sized on out-of-fold realised ratio",

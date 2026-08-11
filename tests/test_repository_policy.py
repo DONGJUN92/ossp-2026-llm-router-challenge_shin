@@ -642,6 +642,8 @@ class RepositoryPolicyTest(unittest.TestCase):
             "!src/ossp_router/__init__.py",
             "!src/ossp_router/cli.py",
             "!src/ossp_router/heuristic.py",
+            # participant router; router-run resolves here (see docs/ROUTER.md)
+            "!src/ossp_router/lpb.py",
             "!src/ossp_router/image_evidence.py",
             "!src/ossp_router/operator_helper.py",
             "!src/ossp_router/orchestrator.py",
@@ -652,6 +654,8 @@ class RepositoryPolicyTest(unittest.TestCase):
             "src/ossp_router/resources/**",
             "!src/ossp_router/resources/__init__.py",
             "!src/ossp_router/resources/routing-policy.v1.json",
+            # participant training artifact, fitted from public Train only
+            "!src/ossp_router/resources/lpb-artifact.v1.json",
             "!baselines/",
             "baselines/**",
             "!baselines/feature_budget.py",

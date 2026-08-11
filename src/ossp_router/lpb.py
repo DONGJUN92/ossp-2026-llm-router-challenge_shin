@@ -198,6 +198,14 @@ class Artifact:
         #: the fit was actually estimated over.
         self.in_range: List[List[float]] = [[float(v) for v in r] for r in blob["in_range"]]
         self.out_range: List[List[float]] = [[float(v) for v in r] for r in blob["out_range"]]
+        #: per-model multiplicative correction so predicted cost is unbiased
+        #: out-of-fold. Smearing fixes the log-to-linear bias in-sample, but
+        #: held out the fit is noisier and axk1-think still came in ~20% under.
+        #: Leaving that in makes the tier margin absorb a cost bias it cannot
+        #: see, which is how Premium ended up spending 2.66 of a 4.0 budget.
+        self.cost_calib: List[float] = [
+            float(v) for v in blob.get("cost_calib", [1.0] * len(self.models))
+        ]
         #: effective fraction of each tier's *excess* budget the router may plan
         #: to spend, chosen offline from out-of-fold realised ratios
         self.tier_excess: Dict[str, float] = {
@@ -272,10 +280,12 @@ def load_artifact(path: Optional[Path] = None) -> Optional[Artifact]:
         return None
 
 
-def _episode_cost(policy: RoutingPolicy, model_id: str, tin: float, tout: float) -> float:
+def _episode_cost(
+    policy: RoutingPolicy, model_id: str, tin: float, tout: float, calib: float = 1.0
+) -> float:
     rates = policy.models[model_id]
     unit = float(policy.token_unit)
-    return (
+    return calib * (
         float(rates.fixed_cost)
         + tin * float(rates.input_token_rate) / unit
         + tout * float(rates.output_token_rate) / unit
@@ -345,7 +355,9 @@ def allocate(
         feats = featurize(text, artifact.dim)
         scores, tokens = artifact.predict(feats)
         costs = [
-            _episode_cost(policy, models[j], tokens[j][0], tokens[j][1])
+            _episode_cost(
+                policy, models[j], tokens[j][0], tokens[j][1], artifact.cost_calib[j]
+            )
             for j in range(len(models))
         ]
         _enforce_monotone_cost(costs, ladder)
