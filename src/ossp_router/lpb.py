@@ -169,6 +169,14 @@ class Artifact:
         self.out_w: List[List[float]] = [[float(v) for v in row] for row in blob["out_w"]]
         self.in_smear: List[float] = [float(v) for v in blob["in_smear"]]
         self.out_smear: List[float] = [float(v) for v in blob["out_smear"]]
+        #: observed token range per model in public Train. A log-linear fit
+        #: extrapolates without bound: on a 70k-character prompt the raw fit
+        #: predicted 1.55M output tokens for ax31-light and 520 for ax31, i.e.
+        #: that the larger model was 25x *cheaper*, which let the allocator buy
+        #: upgrades it believed were free. Predictions are clamped into the box
+        #: the fit was actually estimated over.
+        self.in_range: List[List[float]] = [[float(v) for v in r] for r in blob["in_range"]]
+        self.out_range: List[List[float]] = [[float(v) for v in r] for r in blob["out_range"]]
         #: effective fraction of each tier's *excess* budget the router may plan
         #: to spend, chosen offline from out-of-fold realised ratios
         self.tier_excess: Dict[str, float] = {
@@ -191,6 +199,10 @@ class Artifact:
         for j in range(len(self.models)):
             tin = math.exp(min(_dot(self.in_w[j], feats), 20.0)) * self.in_smear[j]
             tout = math.exp(min(_dot(self.out_w[j], feats), 20.0)) * self.out_smear[j]
+            lo, hi = self.in_range[j]
+            tin = min(max(tin, lo), hi)
+            lo, hi = self.out_range[j]
+            tout = min(max(tout, lo), hi)
             costs.append((tin, tout))
         return scores, costs
 
@@ -224,6 +236,31 @@ def _episode_cost(policy: RoutingPolicy, model_id: str, tin: float, tout: float)
     )
 
 
+def _ladder(policy: RoutingPolicy, models: Sequence[str]) -> List[int]:
+    """Model indices ordered by published output-token rate, cheapest first."""
+    return sorted(
+        range(len(models)),
+        key=lambda j: (
+            float(policy.models[models[j]].output_token_rate),
+            float(policy.models[models[j]].input_token_rate),
+        ),
+    )
+
+
+def _enforce_monotone_cost(costs: List[float], ladder: Sequence[int]) -> None:
+    """Forbid a dearer model from being predicted cheaper, in place.
+
+    For one prompt the published rates rise strictly along the ladder and the
+    dearer model does not emit fewer tokens in practice: on public Dev ``ax31``
+    undercut ``ax31-light`` on 0.35% of episodes and ``axk1-think`` never did.
+    Without this floor a mispredicted episode can offer an upgrade at negative
+    marginal cost, which the allocator will always take and never charge for.
+    """
+    for prev, cur in zip(ladder, ladder[1:]):
+        if costs[cur] < costs[prev]:
+            costs[cur] = costs[prev]
+
+
 def _envelope(costs: Sequence[float], scores: Sequence[float], names: Sequence[str]):
     """Upper concave envelope of (cost, score) options, cheapest first."""
     opts = sorted(zip(costs, scores, names), key=lambda t: (t[0], -t[1]))
@@ -255,6 +292,7 @@ def allocate(
     if n == 0:
         return []
 
+    ladder = _ladder(policy, models)
     plans = []
     base_pred = 0.0
     for text in texts:
@@ -264,6 +302,7 @@ def allocate(
             _episode_cost(policy, models[j], tokens[j][0], tokens[j][1])
             for j in range(len(models))
         ]
+        _enforce_monotone_cost(costs, ladder)
         base_pred += costs[models.index(light)]
         plans.append(_envelope(costs, scores, models))
 

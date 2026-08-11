@@ -48,7 +48,13 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from ossp_router.heuristic import episode_text  # noqa: E402
-from ossp_router.lpb import N_DENSE, content_key, featurize  # noqa: E402
+from ossp_router.lpb import (  # noqa: E402
+    N_DENSE,
+    _enforce_monotone_cost as enforce_monotone_cost,
+    _ladder as lpb_ladder,
+    content_key,
+    featurize,
+)
 from ossp_router.protocol import (  # noqa: E402
     TIERS,
     load_bundled_policy,
@@ -99,6 +105,11 @@ def fit_2pl(X, Y, l2=3.0, iters=900, lr=0.5):
     return w, np.exp(la), b
 
 
+def token_ranges(T: np.ndarray) -> List[Tuple[float, float]]:
+    """Observed token box per model, used to clamp the log-linear extrapolation."""
+    return [(float(T[:, j].min()), float(T[:, j].max())) for j in range(T.shape[1])]
+
+
 def fit_tokens(X, T, alpha=3.0):
     """Log-space regression plus Duan's smearing factor, per model."""
     W, smear = [], []
@@ -142,7 +153,12 @@ def route(texts, P, C, tier, policy, excess) -> List[str]:
     n = len(texts)
     light = policy.light_model_id
     li = MODELS.index(light)
-    plans = [envelope(list(C[i]), list(P[i]), MODELS) for i in range(n)]
+    ladder = lpb_ladder(policy, MODELS)
+    plans = []
+    for i in range(n):
+        costs = list(C[i])
+        enforce_monotone_cost(costs, ladder)
+        plans.append(envelope(costs, list(P[i]), MODELS))
     base = float(np.sum(C[:, li]))
     limit = base * (1.0 + (float(policy.tiers[tier].budget_multiplier) - 1.0) * excess)
     ups = []
@@ -230,9 +246,11 @@ def main() -> int:
         Wout, sout = fit_tokens(X[rest], TOUT[rest], args.alpha)
         th = X[hold] @ w
         P_oof[hold] = 1.0 / (1.0 + np.exp(-np.clip(a[None, :] * (th[:, None] - b[None, :]), -30, 30)))
+        rin = token_ranges(TIN[rest])
+        rout = token_ranges(TOUT[rest])
         for j in range(3):
-            tin = np.exp(np.minimum(X[hold] @ Win[j], 20)) * sin_[j]
-            tout = np.exp(np.minimum(X[hold] @ Wout[j], 20)) * sout[j]
+            tin = np.clip(np.exp(np.minimum(X[hold] @ Win[j], 20)) * sin_[j], *rin[j])
+            tout = np.clip(np.exp(np.minimum(X[hold] @ Wout[j], 20)) * sout[j], *rout[j])
             C_oof[hold, j] = [cost_of(policy, MODELS[j], tin[t], tout[t])
                               for t in range(len(hold))]
 
@@ -285,6 +303,8 @@ def main() -> int:
         "out_w": [[float(v) for v in row] for row in Wout],
         "in_smear": [float(v) for v in sin_],
         "out_smear": [float(v) for v in sout],
+        "in_range": [[lo, hi] for lo, hi in token_ranges(TIN)],
+        "out_range": [[lo, hi] for lo, hi in token_ranges(TOUT)],
         "tier_excess": tier_excess,
         "train_episodes": n,
         "notes": "fitted from public Train only; margins sized on out-of-fold realised ratio",

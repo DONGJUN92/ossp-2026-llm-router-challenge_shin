@@ -150,6 +150,65 @@ class LpbRouterTest(unittest.TestCase):
     def test_empty_batch_is_handled(self):
         self.assertEqual(lpb.allocate([], "fast", self.policy, self.artifact), [])
 
+    def test_token_predictions_stay_inside_the_fitted_range(self):
+        """A log-linear fit extrapolates without bound; the clamp must hold.
+
+        Before the clamp, a 70,000-character prompt drew 1.55M predicted output
+        tokens for ax31-light -- 47x past the 32,768-token generation condition
+        the outcomes were produced under.
+        """
+        for text in ("A" * 70_000, "x", "\n" * 5_000, "가" * 30_000):
+            _, tokens = self.artifact.predict(lpb.featurize(text, self.artifact.dim))
+            for j, (tin, tout) in enumerate(tokens):
+                lo, hi = self.artifact.in_range[j]
+                self.assertGreaterEqual(tin, lo)
+                self.assertLessEqual(tin, hi)
+                lo, hi = self.artifact.out_range[j]
+                self.assertGreaterEqual(tout, lo)
+                self.assertLessEqual(tout, hi)
+
+    def test_a_dearer_model_is_never_priced_below_a_cheaper_one(self):
+        """Otherwise the allocator can buy an upgrade at negative marginal cost.
+
+        The published rates rise strictly along ax31-light -> ax31 -> axk1-think,
+        so a prediction that inverts the order is always a model error, never a
+        real saving.
+        """
+        models = list(self.artifact.models)
+        ladder = lpb._ladder(self.policy, models)
+        self.assertEqual([models[j] for j in ladder],
+                         ["ax31-light", "ax31", "axk1-think"])
+        texts = ["A" * 70_000, "x", "안녕하세요", "def f(x): return x"] + [
+            lpb.episode_text(e) for e in self.inputs.episodes[:200]
+        ]
+        for text in texts:
+            _, tokens = self.artifact.predict(lpb.featurize(text, self.artifact.dim))
+            costs = [
+                lpb._episode_cost(self.policy, models[j], tokens[j][0], tokens[j][1])
+                for j in range(len(models))
+            ]
+            lpb._enforce_monotone_cost(costs, ladder)
+            for prev, cur in zip(ladder, ladder[1:]):
+                self.assertLessEqual(costs[prev], costs[cur], text[:40])
+
+    def test_degenerate_prompts_do_not_route_to_the_think_model_at_fast(self):
+        """A batch of junk must not spend the Fast budget on the 22x model."""
+        batch = parse_input(
+            {
+                "schema_version": 1,
+                "challenge_id": "c",
+                "split": "s",
+                "episodes": [
+                    {"episode_id": f"junk-{i}", "prompt": p}
+                    for i, p in enumerate(
+                        ["A" * 70_000, "\n" * 3_000, "x" * 40_000, "0" * 50_000] * 5
+                    )
+                ],
+            }
+        )
+        got = self._run(batch, "fast")
+        self.assertNotIn("axk1-think", set(got.values()))
+
 
 if __name__ == "__main__":
     unittest.main()
