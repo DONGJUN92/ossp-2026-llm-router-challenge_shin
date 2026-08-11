@@ -587,7 +587,11 @@ def _spdx_of(rel: str) -> set[str]:
     if p.is_file():
         try:
             head = p.read_text(encoding="utf-8", errors="replace")[:4000]
+            # REUSE-IgnoreStart - the pattern below is a matcher, not a declaration;
+            # without this guard `reuse lint` parses it as this file's own licence
+            # and reports an invalid SPDX expression.
             for raw in re.findall(r"SPDX-License-Identifier:\s*([^\n\r]+)", head):
+                # REUSE-IgnoreEnd
                 # An earlier version excluded '-' from the value, which silently
                 # truncated every id at the first hyphen: Apache-2.0 became
                 # "Apache" and then failed the allowlist. Take the rest of the
