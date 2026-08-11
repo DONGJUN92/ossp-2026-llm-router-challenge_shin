@@ -457,8 +457,8 @@ def _oof_predictions(X, Y, TIN, TOUT, texts, policy, args, k, seed, use_grm):
     for f in grouped_folds(texts, k, seed):
         hold = np.asarray(f)
         rest = np.asarray([i for i in range(n) if i not in set(f)])
-        Win, sin_ = fit_tokens(X[rest], TIN[rest], args.alpha)
-        Wout, sout = fit_tokens(X[rest], TOUT[rest], args.alpha)
+        Win, sin_ = fit_tokens(X[rest], TIN[rest], args.cost_alpha)
+        Wout, sout = fit_tokens(X[rest], TOUT[rest], args.cost_alpha)
         if use_grm:
             values = np.unique(Y[rest])
             a_i, thr_i = fit_grm_items(Y[rest], values)
@@ -486,6 +486,10 @@ def main() -> int:
     ap.add_argument("--report", type=Path)
     ap.add_argument("--dim", type=int, default=512)
     ap.add_argument("--alpha", type=float, default=3.0)
+    ap.add_argument("--cost-alpha", type=float, default=3.0,
+                    help="토큰 회귀 전용 ridge 계수. 1/3/10/30 을 재봤고 3~10 은 "
+                         "구분되지 않는 평탄 구간이다 (docs/ROUTER.md '계열별 비용 "
+                         "산포' 절). 기본값은 점수 헤드와 같은 3.0 을 유지한다")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--margin-folds", type=int, default=12,
                     help="마진 산정용 fold 수. 배포 모델은 Train 전체로 적합되므로 "
@@ -617,8 +621,8 @@ def main() -> int:
               f"oof quality {best['oof_quality']:.4f}")
 
     # ---- final fit on all of Train ------------------------------------------
-    Win, sin_ = fit_tokens(X, TIN, args.alpha)
-    Wout, sout = fit_tokens(X, TOUT, args.alpha)
+    Win, sin_ = fit_tokens(X, TIN, args.cost_alpha)
+    Wout, sout = fit_tokens(X, TOUT, args.cost_alpha)
     values = np.unique(Y)
     if use_grm:
         a, thr = fit_grm_items(Y, values)
