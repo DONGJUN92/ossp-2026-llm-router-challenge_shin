@@ -110,6 +110,148 @@ def token_ranges(T: np.ndarray) -> List[Tuple[float, float]]:
     return [(float(T[:, j].min()), float(T[:, j].max())) for j in range(T.shape[1])]
 
 
+C_PROBIT = math.pi / 8.0
+
+
+def _softplus(x):
+    return np.logaddexp(0.0, x)
+
+
+class _Adam:
+    def __init__(self, params, lr):
+        self.p, self.lr, self.t = params, lr, 0
+        self.m = [np.zeros_like(x) for x in params]
+        self.v = [np.zeros_like(x) for x in params]
+
+    def step(self, grads):
+        self.t += 1
+        for i, (p, g) in enumerate(zip(self.p, grads)):
+            self.m[i] = 0.9 * self.m[i] + 0.1 * g
+            self.v[i] = 0.999 * self.v[i] + 0.001 * g * g
+            p -= self.lr * (self.m[i] / (1 - 0.9 ** self.t)) / (
+                np.sqrt(self.v[i] / (1 - 0.999 ** self.t)) + 1e-8
+            )
+
+
+def fit_grm_items(Q, values, K=31, steps=400, lr=0.05):
+    """Samejima graded response model, ability integrated out.
+
+    MEASURED AND NOT ADOPTED. Reproduce with ``--predictor grm``.
+
+    The ordinal model is the better description of the data -- ``score`` really
+    does take five ordered values -- and it wins on mean absolute error
+    (0.3042 against 0.3384) and on grouped-CV routing score (+0.069, 2.9x
+    paired SE). On the held-out public Dev it nevertheless *loses*: 0.6715
+    against 0.6822, and it never selects ``axk1-think`` at any tier, leaving
+    Premium at ratio 1.69 of a 4.0 budget.
+
+    The reason is a flaw in the CV metric, not in the model. A tier scores zero
+    when it breaches its budget, so a predictor that rarely upgrades cannot
+    breach and looks both better and far more stable. MML calibrates the items
+    against a population ability; ``axk1-think`` comes out with discrimination
+    1.63 against 3.83 and 4.73 for the others, so its expected score rarely
+    exceeds ``ax31`` and the allocator is offered almost no upgrades to buy.
+    Fitting ability and items jointly, as ``fit_2pl`` does, lets the items adapt
+    to the variation the features can actually explain.
+
+    ``score`` takes five ordered values (0, .25, .5, .75, 1) and 8% of the
+    public grid sits strictly between 0 and 1. A binary item model has to round
+    those away; the graded model puts a threshold between each pair of adjacent
+    levels instead. Thresholds are kept ordered by construction (first threshold
+    plus softplus increments), and ability is integrated over N(0,1) by
+    Gauss-Hermite quadrature so the item parameters are not fitted jointly with
+    a per-episode ability that would absorb them.
+    """
+    N, M = Q.shape
+    L = len(values)
+    g = np.abs(Q[..., None] - values[None, None, :]).argmin(-1)
+    t, w = np.polynomial.hermite_e.hermegauss(K)
+    logw = np.log(w / np.sqrt(2 * np.pi))
+    raw_a = np.full(M, 0.55)
+    b1 = np.zeros(M)
+    raw_d = np.full((M, L - 2), -0.5) if L > 2 else np.zeros((M, 0))
+    onehot = np.eye(L, dtype=bool)[g]
+    opt = _Adam([raw_a, b1, raw_d], lr)
+
+    def thresholds(b1_, raw_d_):
+        if L == 2:
+            return b1_[:, None]
+        return np.concatenate(
+            [b1_[:, None], b1_[:, None] + np.cumsum(_softplus(raw_d_), axis=1)], axis=1
+        )
+
+    for _ in range(steps):
+        a = _softplus(raw_a)
+        thr = thresholds(b1, raw_d)
+        P = 1.0 / (1.0 + np.exp(-np.clip(a[None, :, None] * (t[:, None, None] - thr[None, :, :]), -30, 30)))
+        cum = np.concatenate([np.ones((K, M, 1)), P, np.zeros((K, M, 1))], axis=2)
+        pr = np.clip(cum[..., :-1] - cum[..., 1:], 1e-12, 1.0)
+        obs = np.transpose(np.stack([pr[:, m, g[:, m]] for m in range(M)], axis=2), (1, 0, 2))
+        s = np.log(obs).sum(axis=2) + logw[None, :]
+        mx = s.max(axis=1, keepdims=True)
+        Ls = np.exp(s - mx)
+        r = Ls / Ls.sum(axis=1, keepdims=True)
+        inv = np.zeros((N, K, M, L))
+        inv[onehot[:, None, :, :].repeat(K, axis=1)] = (1.0 / obs).ravel()
+        dC = np.zeros((N, K, M, L + 1))
+        dC[..., :-1] += inv
+        dC[..., 1:] -= inv
+        dC = dC[..., 1:-1]
+        dP = P * (1.0 - P)
+        wgt = np.einsum("nk,nkml->kml", r, dC)
+        ga = (wgt * dP * (t[:, None, None] - thr[None, :, :])).sum(axis=(0, 2)) * (
+            1.0 / (1.0 + np.exp(-raw_a))
+        )
+        gthr = -(wgt * dP).sum(axis=0) * a[:, None]
+        gb1 = gthr.sum(axis=1)
+        gd = (
+            np.cumsum(gthr[:, ::-1], axis=1)[:, ::-1][:, 1:] * (1.0 / (1.0 + np.exp(-raw_d)))
+            if L > 2
+            else np.zeros((M, 0))
+        )
+        opt.step([-ga / N, -gb1 / N, -gd / N])
+    return _softplus(raw_a), thresholds(b1, raw_d)
+
+
+def grm_expected(X, Wmu, Ws, a, thr, values):
+    """``X`` is the raw design matrix: featurize() already carries a constant
+    column at index dim+15, so no extra intercept is appended here. Adding one
+    would make the head vectors one longer than the runtime feature vector."""
+    mu = X @ Wmu
+    s = _softplus(X @ Ws)
+    d = np.sqrt(1.0 + C_PROBIT * (a[None, :, None] ** 2) * (s[:, None, None] ** 2))
+    z = a[None, :, None] * (mu[:, None, None] - thr[None, :, :]) / d
+    P = 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
+    n, M, _ = P.shape
+    cum = np.concatenate([np.ones((n, M, 1)), P, np.zeros((n, M, 1))], axis=2)
+    pr = np.clip(cum[..., :-1] - cum[..., 1:], 1e-12, 1.0)
+    return (pr * values[None, None, :]).sum(axis=2), (mu, s, d, z, P)
+
+
+def fit_grm_heads(X, Q, a, thr, values, steps=600, lr=0.05, l2=1e-4):
+    """Amortise the ability with items frozen, against the predictive objective.
+
+    Regressing features onto the posterior ability summaries instead was
+    measured and lost badly (-0.085): it improves mean absolute error while
+    compressing the per-model gaps the allocator actually ranks on. Fitting the
+    heads to predict the observed scores keeps those gaps.
+    """
+    Wmu = np.zeros(X.shape[1])
+    Ws = np.zeros(X.shape[1])
+    opt = _Adam([Wmu, Ws], lr)
+    dv = (values[:-1] - values[1:])[None, None, :]
+    for _ in range(steps):
+        E, (mu, s, d, z, P) = grm_expected(X, Wmu, Ws, a, thr, values)
+        r = (E - Q) / Q.size
+        dP = P * (1.0 - P)
+        dz_dmu = a[None, :, None] / d
+        dz_ds = -z * C_PROBIT * (a[None, :, None] ** 2) * s[:, None, None] / (d ** 2)
+        gm = (r[:, :, None] * dv * dP * dz_dmu).sum(axis=(1, 2))
+        gs = (r[:, :, None] * dv * dP * dz_ds).sum(axis=(1, 2)) / (1.0 + np.exp(-(X @ Ws)))
+        opt.step([X.T @ gm + l2 * Wmu, X.T @ gs + l2 * Ws])
+    return Wmu, Ws
+
+
 def fit_tokens(X, T, alpha=3.0):
     """Log-space regression plus Duan's smearing factor, per model."""
     W, smear = [], []
@@ -197,6 +339,13 @@ def grouped_folds(texts: Sequence[str], k: int, seed: int) -> List[List[int]]:
         key = content_key(" ".join(s.split()[:40]))
         groups.setdefault(key, []).append(i)
     order = sorted(groups.values(), key=lambda g: (-len(g), g[0]))
+    # Break ties between equal-sized groups differently per seed, so repeated
+    # runs give genuinely different partitions. Without this every "seed"
+    # returns the same folds and any variance estimate across seeds is zero by
+    # construction rather than by agreement.
+    rnd = np.random.default_rng(seed)
+    rnd.shuffle(order)
+    order.sort(key=len, reverse=True)
     folds: List[List[int]] = [[] for _ in range(k)]
     for grp in order:
         folds.sort(key=len)
@@ -215,7 +364,10 @@ def main() -> int:
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--target-headroom", type=float, default=0.90,
                     help="out-of-fold 실현 비율이 한도의 이 비율을 넘지 않도록 마진을 정한다")
+    ap.add_argument("--predictor", choices=("2pl", "grm"), default="2pl",
+                    help="grm 은 측정 후 기각된 대안이다 (fit_grm_items docstring 참조)")
     args = ap.parse_args()
+    use_grm = args.predictor == "grm"
 
     policy = load_bundled_policy()
     rows = load_pairs(args.train_input, args.train_outcomes)
@@ -241,11 +393,18 @@ def main() -> int:
     for f in folds:
         hold = np.asarray(f)
         rest = np.asarray([i for i in range(n) if i not in set(f)])
-        w, a, b = fit_2pl(X[rest], Y[rest], l2=args.alpha)
         Win, sin_ = fit_tokens(X[rest], TIN[rest], args.alpha)
         Wout, sout = fit_tokens(X[rest], TOUT[rest], args.alpha)
-        th = X[hold] @ w
-        P_oof[hold] = 1.0 / (1.0 + np.exp(-np.clip(a[None, :] * (th[:, None] - b[None, :]), -30, 30)))
+        if use_grm:
+            values = np.unique(Y[rest])
+            a_i, thr_i = fit_grm_items(Y[rest], values)
+            Wmu_i, Ws_i = fit_grm_heads(X[rest], Y[rest], a_i, thr_i, values)
+            P_oof[hold] = grm_expected(X[hold], Wmu_i, Ws_i, a_i, thr_i, values)[0]
+        else:
+            w_i, a_i, b_i = fit_2pl(X[rest], Y[rest], l2=args.alpha)
+            th = X[hold] @ w_i
+            P_oof[hold] = 1.0 / (1.0 + np.exp(
+                -np.clip(a_i[None, :] * (th[:, None] - b_i[None, :]), -30, 30)))
         rin = token_ranges(TIN[rest])
         rout = token_ranges(TOUT[rest])
         for j in range(3):
@@ -273,8 +432,12 @@ def main() -> int:
             realised = sum(TRUE_C[i, MODELS.index(picks[i])] for i in range(n)) / true_base
             quality = float(np.mean([Y[i, MODELS.index(picks[i])] for i in range(n)]))
             rows_t.append({"excess": cand, "realised_ratio": realised, "oof_quality": quality})
-            if realised <= target:
-                chosen = cand
+            # Take the largest margin whose whole prefix is still under target.
+            # Scanning for the maximum passing candidate would step over a
+            # failing region and ship a margin that is only safe by accident.
+            if realised > target:
+                break
+            chosen = cand
         tier_excess[tier] = chosen
         best = [r for r in rows_t if r["excess"] == chosen][0]
         margin_report[tier] = {"chosen_excess": chosen, "target_ratio": target, **best,
@@ -284,11 +447,23 @@ def main() -> int:
               f"oof quality {best['oof_quality']:.4f}")
 
     # ---- final fit on all of Train ------------------------------------------
-    w, a, b = fit_2pl(X, Y, l2=args.alpha)
     Win, sin_ = fit_tokens(X, TIN, args.alpha)
     Wout, sout = fit_tokens(X, TOUT, args.alpha)
-    print(f"\nfinal 2PL discrimination a = {np.round(a, 4).tolist()}")
-    print(f"final 2PL difficulty     b = {np.round(b, 4).tolist()}")
+    values = np.unique(Y)
+    if use_grm:
+        a, thr = fit_grm_items(Y, values)
+        Wmu, Ws = fit_grm_heads(X, Y, a, thr, values)
+        b = np.zeros(len(MODELS))
+        print(f"\ngraded levels              = {values.tolist()}")
+        print(f"final GRM discrimination a = {np.round(a, 4).tolist()}")
+        for j, m in enumerate(MODELS):
+            print(f"  {m:11s} thresholds = {np.round(thr[j], 4).tolist()}")
+    else:
+        Wmu, a, b = fit_2pl(X, Y, l2=args.alpha)
+        Ws = np.zeros_like(Wmu)
+        thr = np.zeros((len(MODELS), 0))
+        print(f"\nfinal 2PL discrimination a = {np.round(a, 4).tolist()}")
+        print(f"final 2PL difficulty     b = {np.round(b, 4).tolist()}")
 
     blob = {
         "schema_version": 1,
@@ -296,7 +471,13 @@ def main() -> int:
         "models": list(MODELS),
         "dim": args.dim,
         "n_dense": N_DENSE,
-        "theta_w": [float(v) for v in w],
+        "grm": bool(use_grm),
+        "values": [float(v) for v in values],
+        "thresholds": [[float(v) for v in row] for row in thr],
+        # featurize() already carries a constant column, so the head vectors
+        # are exactly dim + N_DENSE long and need no appended intercept.
+        "theta_w": [float(v) for v in Wmu],
+        "sigma_w": [float(v) for v in Ws],
         "disc": [float(v) for v in a],
         "diff": [float(v) for v in b],
         "in_w": [[float(v) for v in row] for row in Win],
@@ -323,8 +504,9 @@ def main() -> int:
             json.dumps({"margins": margin_report,
                         "oof_cost_ratio": {m: float(C_oof[:, j].sum() / TRUE_C[:, j].sum())
                                            for j, m in enumerate(MODELS)},
+                        "graded_levels": [float(v) for v in values],
                         "disc": [float(v) for v in a],
-                        "diff": [float(v) for v in b]},
+                        "thresholds": [[float(v) for v in row] for row in thr]},
                        ensure_ascii=False, indent=2),
             encoding="utf-8",
         )

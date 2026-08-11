@@ -87,6 +87,9 @@ _SENT = re.compile(r"[.!?。！？]")
 
 N_DENSE = 16
 
+#: probit approximation constant for integrating a logistic over a normal
+_C_PROBIT = math.pi / 8.0
+
 
 def _tokens(text: str) -> List[str]:
     toks = _WORD.findall(text.lower())
@@ -165,6 +168,24 @@ class Artifact:
         self.theta_w: List[float] = [float(v) for v in blob["theta_w"]]
         self.disc: List[float] = [float(v) for v in blob["disc"]]
         self.diff: List[float] = [float(v) for v in blob["diff"]]
+        #: Graded response model. score is ordinal with five observed levels
+        #: (0, .25, .5, .75, 1), so a binary item model throws away the middle.
+        #: Measured on grouped CV with everything else held fixed, the ordinal
+        #: model plus a spread head is worth about +0.067 final score.
+        self.grm: bool = bool(blob.get("grm", False))
+        self.values: List[float] = [float(v) for v in blob.get("values", ())]
+        self.thresholds: List[List[float]] = [
+            [float(v) for v in row] for row in blob.get("thresholds", ())
+        ]
+        self.sigma_w: List[float] = [float(v) for v in blob.get("sigma_w", ())]
+        if self.grm:
+            if len(self.sigma_w) != self.dim + N_DENSE:
+                raise ProtocolError("sigma_w 길이가 theta_w 와 달라야 하지 않습니다.")
+            if len(self.thresholds) != len(self.models):
+                raise ProtocolError("thresholds 행 수가 모델 수와 다릅니다.")
+            for row in self.thresholds:
+                if len(row) != len(self.values) - 1:
+                    raise ProtocolError("thresholds 열 수는 등급 수 - 1 이어야 합니다.")
         self.in_w: List[List[float]] = [[float(v) for v in row] for row in blob["in_w"]]
         self.out_w: List[List[float]] = [[float(v) for v in row] for row in blob["out_w"]]
         self.in_smear: List[float] = [float(v) for v in blob["in_smear"]]
@@ -189,12 +210,37 @@ class Artifact:
         if len(self.models) != len(self.disc) != len(self.diff):
             raise ProtocolError("모델 수와 IRT 파라미터 수가 다릅니다.")
 
+    def _expected_scores(self, feats: Sequence[float]) -> List[float]:
+        """E[score] per model.
+
+        With a graded response model the ability is a posterior, not a point:
+        ``mu(x)`` locates the prompt on the latent scale and ``sigma(x)`` says
+        how sure we are. The probit correction ``/sqrt(1 + (pi/8) a^2 sigma^2)``
+        flattens the curve where the prompt is ambiguous, which keeps the
+        per-model *gaps* honest -- and the allocator ranks on gaps, not levels.
+        """
+        if not self.grm:
+            theta = _dot(self.theta_w, feats)
+            return [_sigmoid(a * (theta - b)) for a, b in zip(self.disc, self.diff)]
+
+        mu = _dot(self.theta_w, feats)
+        sigma = math.log1p(math.exp(min(_dot(self.sigma_w, feats), 30.0)))
+        out = []
+        for j, a in enumerate(self.disc):
+            d = math.sqrt(1.0 + _C_PROBIT * a * a * sigma * sigma)
+            prev = 1.0
+            exp_q = 0.0
+            for k, thr in enumerate(self.thresholds[j]):
+                cur = _sigmoid(a * (mu - thr) / d)
+                exp_q += self.values[k] * (prev - cur)
+                prev = cur
+            exp_q += self.values[-1] * prev
+            out.append(min(max(exp_q, 0.0), 1.0))
+        return out
+
     def predict(self, feats: Sequence[float]) -> Tuple[List[float], List[float]]:
         """Return (per-model score, per-model cost-in-credits) for one prompt."""
-        theta = _dot(self.theta_w, feats)
-        scores = [
-            _sigmoid(a * (theta - b)) for a, b in zip(self.disc, self.diff)
-        ]
+        scores = self._expected_scores(feats)
         costs = []
         for j in range(len(self.models)):
             tin = math.exp(min(_dot(self.in_w[j], feats), 20.0)) * self.in_smear[j]
