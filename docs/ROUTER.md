@@ -426,8 +426,8 @@ Dev 에서 졌다. 원인은 모형이 아니라 **지표**다 — 예산을 넘
 | 업스트림 URL | 없음 — 외부에서 받은 모델·가중치가 아니라 이 저장소가 공개 Train 에서 직접 적합한 계수입니다 |
 | 학습 입력 | `data/materialized/train/inputs.json` (SHA-256 `029a0fb1f70432a05b837a1291d86d42278bb202d808a6a12911b0dae8628ac4`) |
 | 학습 결과 | `data/train/outcomes.json` (SHA-256 `0a35c1ce83e074ffc8e470d5c4f49d35765371384ecff3db91bad9de4ef2ffe7`) |
-| 산출물 SHA-256 | `120e1dd951cbfcf1bd18b22d356430aaa2c2b11a0508ea06043d56f90e15f1ac` |
-| 크기 | 76,750 바이트 |
+| 산출물 SHA-256 | `9747b429cdf12ac5368021a3bbaf6232fafd0cb37ab5c82034c849a83cfe5fd3` |
+| 크기 | 79,136 바이트 |
 | 라이선스 | Apache-2.0 (이 저장소와 동일) |
 | 학습 의존성 | NumPy (BSD-3-Clause) — **학습 전용이며 제출 이미지에 포함되지 않습니다** |
 
