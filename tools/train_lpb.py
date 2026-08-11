@@ -404,7 +404,7 @@ def _template_groups(texts: Sequence[str]) -> List[List[int]]:
 def ratio_quantile_under_shift(
     texts, P, C, TRUE_C, policy, tier, excess, groups, *,
     worlds: int = 40, concentration: float = 4.0, seed: int = 0,
-    quantile: float = 0.95,
+    quantile: float = 0.95, parametric: bool = True, z_tail: float = 2.33,
 ) -> float:
     """Upper quantile of the realised cost ratio across resampled compositions.
 
@@ -446,7 +446,18 @@ def ratio_quantile_under_shift(
             ratios.append(spend / base)
     if not ratios:
         return float("inf")
-    return float(np.quantile(np.asarray(ratios), quantile))
+    r = np.asarray(ratios)
+    if not parametric:
+        return float(np.quantile(r, quantile))
+    # Parametric tail instead of an empirical quantile. The empirical p95 over
+    # 60 worlds says nothing about what happens past it, and Balanced sat at
+    # p95 1.894 against a 2.0 limit while still breaching 2.5-3% of the time --
+    # the whole exceedance lived beyond the estimated quantile. Ratios across
+    # worlds are close to log-normal, so mean + z*sd of the log gives a bound
+    # estimated from the whole sample that automatically tightens for tiers
+    # whose ratio distribution is wide and loosens for narrow ones.
+    lr = np.log(np.maximum(r, 1e-9))
+    return float(np.exp(lr.mean() + z_tail * lr.std(ddof=1)))
 
 
 def _oof_predictions(X, Y, TIN, TOUT, texts, policy, args, k, seed, use_grm):
@@ -504,7 +515,11 @@ def main() -> int:
                     help="작을수록 혼합비가 크게 흔들린다. Train 계열 재추출만으로는 "
                          "Train→비공개셋 이동을 다 담지 못하므로 보수적으로 잡는다")
     ap.add_argument("--shift-quantile", type=float, default=0.95,
-                    help="혼합비 변화 하 비용 비율의 이 분위수가 한도를 넘지 않아야 한다")
+                    help="--no-parametric-tail 일 때 쓰는 경험 분위수")
+    ap.add_argument("--z-tail", type=float, default=2.33,
+                    help="로그정규 꼬리 한계의 z. 2.33 = 상위 1%")
+    ap.add_argument("--no-parametric-tail", action="store_true",
+                    help="경험 분위수로 되돌린다 (재현용)")
     ap.add_argument("--split-drift", type=float, default=1.10,
                     help="분할 간 비용 구조 차이를 덮는 derate. 계열 재추출은 Train "
                          "안의 혼합비만 흔들 뿐 분할 전체의 단가 구조 차이는 못 본다")
@@ -596,6 +611,7 @@ def main() -> int:
                     cand, groups, worlds=args.shift_worlds,
                     concentration=args.shift_concentration, seed=17 + r,
                     quantile=args.shift_quantile,
+                    parametric=not args.no_parametric_tail, z_tail=args.z_tail,
                 )
                 for r, (Pr, Cr) in enumerate(oof_sets)
             )
