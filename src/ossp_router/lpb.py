@@ -36,9 +36,7 @@ only so the submission image needs no third-party runtime dependency.
 from __future__ import annotations
 
 import argparse
-import json
 import math
-import os
 import re
 import sys
 import zlib
@@ -49,7 +47,6 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from .protocol import (
     TIERS,
     Decision,
-    Episode,
     InputBatch,
     ProtocolError,
     RoutingPolicy,

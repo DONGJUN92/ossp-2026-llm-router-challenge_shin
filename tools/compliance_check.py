@@ -104,7 +104,7 @@ def group_a() -> dict:
     rec("A", "A5", bool(re.fullmatch(r"[0-9a-f]{40}", sha)),
         f"commit_sha 40자리 소문자 16진수 ({sha[:12]}...)")
     exists = git("cat-file", "-t", sha) == "commit" if sha else False
-    rec("A", "A6", exists, f"commit_sha 가 이 저장소에 실제로 존재")
+    rec("A", "A6", exists, "commit_sha 가 이 저장소에 실제로 존재")
     if exists:
         anc = subprocess.run(["git", "-C", str(ROOT), "merge-base",
                               "--is-ancestor", sha, "HEAD"]).returncode == 0
@@ -194,7 +194,7 @@ def group_b(image: str | None, meta: dict) -> bool:
                           f"https://ghcr.io/v2/{ns}/manifests/{want}"])
                 try:
                     mj = json.loads(man.stdout)
-                    tot = sum(int(l["size"]) for l in mj.get("layers", []))
+                    tot = sum(int(layer["size"]) for layer in mj.get("layers", []))
                     layers_ok = tot <= 1024 ** 3
                     layer_note = (f"압축 계층 {len(mj['layers'])}개 합계 "
                                   f"{tot/1024**2:.1f} MiB <= 1 GiB")
@@ -367,13 +367,14 @@ def group_c(image: str | None, have_docker: bool) -> dict:
             and len(r.stderr.encode()) <= 1024 ** 2,
             f"{tier}: stdout {len(r.stdout.encode())}B / stderr {len(r.stderr.encode())}B <= 1 MiB 각각")
         listing, body = _read_out_volume(vol)
-        names = [l.split()[-1] for l in listing.splitlines()[1:]
-                 if l.strip() and l.split()[-1] not in (".", "..")]
+        names = [row.split()[-1] for row in listing.splitlines()[1:]
+                 if row.strip() and row.split()[-1] not in (".", "..")]
         rec("C", f"C4{tier[0]}", names == ["submission.json"],
             f"{tier}: 출력 볼륨 루트에 submission.json 하나만 ({names})",
             "RUNTIME.md: submission.json 외의 파일·디렉터리·링크 금지")
-        mode_ok = any(l.startswith("-rw-r--r--") and l.rstrip().endswith("submission.json")
-                      for l in listing.splitlines())
+        mode_ok = any(row.startswith("-rw-r--r--")
+                      and row.rstrip().endswith("submission.json")
+                      for row in listing.splitlines())
         rec("C", f"C5{tier[0]}", mode_ok, f"{tier}: 출력 파일 권한 0644")
         try:
             payload = json.loads(body)

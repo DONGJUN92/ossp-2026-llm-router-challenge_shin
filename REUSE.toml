@@ -58,3 +58,18 @@ path = [
 precedence = "override"
 SPDX-FileCopyrightText = "Copyright 2026 SK TELECOM CO., LTD."
 SPDX-License-Identifier = "Apache-2.0"
+
+# Participant-added files. The two Markdown files carry the SPDX header inline;
+# they are listed here for the same reason as the block above, because REUSE 6.2
+# misdetects the encoding of Korean-heavy Markdown and then reports the header as
+# missing. submission-ossp-skt.json cannot carry a comment at all: the technical
+# submission schema rejects unknown fields, so the annotation has to live here.
+[[annotations]]
+path = [
+  "docs/GHCR_WALKTHROUGH.md",
+  "docs/ROUTER.md",
+  "submission-ossp-skt.json",
+]
+precedence = "override"
+SPDX-FileCopyrightText = "Copyright 2026 DONGJUN92"
+SPDX-License-Identifier = "Apache-2.0"

@@ -40,7 +40,6 @@ import json
 import math
 import re
 import sys
-from decimal import Decimal
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
@@ -422,7 +421,6 @@ def ratio_quantile_under_shift(
     the tiers correctly.
     """
     rng = np.random.default_rng(seed)
-    limit = float(policy.tiers[tier].budget_multiplier)
     li = MODELS.index(policy.light_model_id)
     n = len(texts)
     # alpha proportional to the observed share, scaled by concentration: small

@@ -15,7 +15,6 @@ position alone.
 
 from __future__ import annotations
 
-import json
 import random
 import sys
 import unittest
@@ -145,7 +144,14 @@ class LpbRouterTest(unittest.TestCase):
         )
         sub = lpb.make_submission(small, self.policy, "fast", artifact=None)
         payload = submission_to_dict(sub)
-        self.assertEqual(len(payload["decisions"]), 20)
+        # Sized from the batch, not a literal: setUpClass falls back to the
+        # 3-episode toy input when data/materialized is absent, which is the
+        # state of a fresh clone. A hardcoded 20 fails there for no real reason.
+        self.assertEqual(len(payload["decisions"]), len(small.episodes))
+        self.assertEqual(
+            [d["episode_id"] for d in payload["decisions"]],
+            [e.episode_id for e in small.episodes],
+        )
 
     def test_empty_batch_is_handled(self):
         self.assertEqual(lpb.allocate([], "fast", self.policy, self.artifact), [])
