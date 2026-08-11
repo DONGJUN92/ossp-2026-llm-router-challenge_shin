@@ -521,8 +521,16 @@ CPU 2 · 메모리 2 GiB · 프로세스 32 · 네트워크 없음 · 읽기 전
 네이티브 실행보다 **느린 쪽**입니다. 네이티브(x86, 컨테이너 없음) 참고값은 2,640문항
 등급당 2.2~2.4초입니다.
 
-`tools/check_runtime.py` 자체는 POSIX 전용(`fcntl`)이라 Windows 개발 환경에서 직접
-실행할 수 없습니다. 위 수치는 같은 이미지·같은 입력·같은 자원 플래그로 `docker run` 을
-직접 호출해 측정했고, 출력은 공식 파서(`ossp_router.protocol.load_submission`)로
-검증했습니다. 이전에 WSL 에서 공식 하네스를 돌렸을 때는 `"passed": true` 였습니다
-(당시 37.3 / 35.1 / 39.9초). **공식 환경의 최종 판정은 운영자 실행을 따릅니다.**
+`tools/check_runtime.py` 는 POSIX 전용 기능 다섯 가지(`fcntl.flock`, `resource`,
+`os.O_NOFOLLOW`, `os.geteuid`, `signal.SIGKILL`)를 쓰므로 Windows 의 Python 으로는
+import 되지 않습니다. 그 다섯을 가짜 모듈로 대체하는 방법은 택하지 않았습니다.
+셋이 검사 그 자체(심볼릭 링크 차단, 권한 확인, 동시 실행 방지)라서, 무동작으로
+바꾸면 통과가 아무것도 보증하지 않기 때문입니다.
+
+대신 Docker Desktop 데몬을 공유하는 Linux 컨테이너 안에서 원본을 그대로 실행합니다.
+절차와 함정은 [`WINDOWS_RUNTIME_CHECK.md`](WINDOWS_RUNTIME_CHECK.md) 에 있고,
+[`../tools/check_runtime_windows.ps1`](../tools/check_runtime_windows.ps1) 이 경로
+정합을 자동으로 계산합니다. 제출 이미지의 결과는 `"passed": true` 이며, 등급별
+5회 반복에서 **출력 SHA-256 이 전부 동일**했습니다 (중앙값 32.73 / 36.38 / 30.86초,
+한도 90초). 이 시간은 amd64 에서 QEMU 로 변환한 값이라 실제보다 느립니다.
+**공식 환경의 최종 판정은 운영자 실행을 따릅니다.**

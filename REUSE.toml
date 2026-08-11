@@ -68,8 +68,10 @@ SPDX-License-Identifier = "Apache-2.0"
 path = [
   "docs/GHCR_WALKTHROUGH.md",
   "docs/ROUTER.md",
+  "docs/WINDOWS_RUNTIME_CHECK.md",
   "src/ossp_router/resources/lpb-artifact.v1.json",
   "submission-ossp-skt.json",
+  "tools/check_runtime_windows.ps1",
 ]
 precedence = "override"
 SPDX-FileCopyrightText = "Copyright 2026 DONGJUN92"
