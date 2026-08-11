@@ -23,6 +23,7 @@ rather than silently passing.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -69,6 +70,38 @@ def sh(args: list[str], timeout: int = 600):
     out = (r.stdout or b"").decode("utf-8", "replace")
     err = (r.stderr or b"").decode("utf-8", "replace")
     return subprocess.CompletedProcess(r.args, r.returncode, out, err)
+
+
+def _anon_status(url: str) -> int | None:
+    """HTTP status for an unauthenticated GET, or None if the network is unusable.
+
+    Deliberately credential-free: the question these answer is whether a judge
+    with no access to this account can open the submission, so anything that
+    could pick up an ambient token would defeat the check.
+    """
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, method="GET",
+                                 headers={"User-Agent": "ossp-compliance"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return int(resp.status)
+    except urllib.error.HTTPError as exc:
+        return int(exc.code)
+    except Exception:
+        return None
+
+
+def _anon_get(url: str):
+    import urllib.request
+    req = urllib.request.Request(url, method="GET",
+                                 headers={"User-Agent": "ossp-compliance",
+                                          "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- A metadata
@@ -279,12 +312,18 @@ def group_f() -> None:
 
 
 # ---------------------------------------------------------------- C runtime
+# Mirrors src/ossp_router/runtime.py's official argv. G8 asserts no flag the
+# operator applies is missing here: an earlier version omitted --cap-drop ALL and
+# --security-opt no-new-privileges, so the harness ran the container with more
+# privilege than the evaluation will, and could not have caught a dependency on
+# a capability. /tmp also has to be noexec,nosuid as the operator mounts it.
 RUN_FLAGS = [
     "--rm", "--platform", "linux/arm64", "--network", "none", "--read-only",
     "--user", "65532:65532", "--cpus", "2", "--memory", "2g", "--memory-swap", "2g",
     "--pids-limit", "32", "--ipc", "none", "--cgroupns", "private",
     "--ulimit", "core=0:0", "--log-driver", "none", "--no-healthcheck",
-    "--stop-signal", "SIGTERM", "--tmpfs", "/tmp:size=256m",
+    "--cap-drop", "ALL", "--security-opt", "no-new-privileges",
+    "--stop-signal", "SIGTERM", "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m",
 ]
 
 
@@ -438,11 +477,43 @@ def group_d(image: str | None, have_docker: bool, base: dict) -> None:
              if p in rt]
     rec("D", "D1", not reads, f"런타임 모듈이 outcome API 를 호출하지 않음 {reads}",
         "CHALLENGE_RULES.md: 문항별 평가 결과는 라우터에 전달되지 않음")
+    # Metadata may be read to write a decision back, never to choose a model. An
+    # earlier version of this check recorded PASS unconditionally and deferred to
+    # D3-D6, which made three checks vacuous: they inflated the PASS count while
+    # asserting nothing. Decide it statically instead, by scope. The dynamic
+    # invariance runs (D3-D7) remain the behavioural proof.
+    DECIDING = ("_tokens", "featurize", "content_key", "_dot", "_sigmoid",
+                "_episode_cost", "_ladder", "_enforce_monotone_cost", "_envelope",
+                "allocate", "predict", "_expected_scores")
+    IO_ONLY = ("make_submission", "main", "_parser", "load_artifact")
+    import ast
+    tree = ast.parse(rt)
+    bodies: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            names = set()
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Name):
+                    names.add(sub.id)
+                elif isinstance(sub, ast.Attribute):
+                    names.add(sub.attr)
+                elif isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                    names.add(sub.value)
+            bodies[node.name] = names
+    missing = [f for f in DECIDING if f not in bodies]
+    # Positive control: episode_id must still be visible somewhere in the I/O path.
+    # Without it, a rename of the deciding functions would make every assertion
+    # below pass by scanning nothing at all.
+    control = any(f in bodies and "episode_id" in bodies[f] for f in IO_ONLY)
     for bad in ("episode_id", "split", "challenge_id"):
-        # allowed only for writing the decision back, never as a routing feature
-        uses = re.findall(rf"\b{bad}\b", rt)
-        rec("D", f"D2-{bad[:4]}", True,
-            f"{bad} 등장 {len(uses)}회 — 선택 로직 사용 여부는 D3~D5 동적 검사로 판정")
+        leaked = sorted(f for f in DECIDING if f in bodies and bad in bodies[f])
+        elsewhere = sorted(f for f in bodies if bad in bodies[f] and f not in DECIDING)
+        rec("D", f"D2-{bad[:4]}", not leaked and not missing and control,
+            f"{bad} 가 선택 경로 {len(DECIDING)}개 함수에 없음"
+            + (f" (누락 함수 {missing})" if missing else "")
+            + ("" if control else " (대조 실패: I/O 경로에서도 episode_id 미발견)")
+            + (f" — 유출 {leaked}" if leaked else f"; I/O 경로에만 등장 {elsewhere}"),
+            "CHALLENGE_RULES.md: 이 세 필드는 실행 검증과 결정 연결에만 사용")
     if not (have_docker and image and base):
         rec("D", "D3", None, "컨테이너 결과 없음 — ID·순서 감사 생략")
         return
@@ -487,7 +558,247 @@ def group_d(image: str | None, have_docker: bool, base: dict) -> None:
     mism = [k for k in ref if ref[k] != got[k]]
     rec("D", "D6", not mism, f"split 값 변경 후 선택 동일 (불일치 {len(mism)})",
         "CHALLENGE_RULES.md: split 에 따라 선택을 바꾸는 방식 금지")
+
+    # D6 only moved split; challenge_id was still the real one in every variant
+    # above, so keying on it would have gone unnoticed.
+    got = run_variant("cid", eps, cid="ossp-2026-some-other-challenge")
+    mism = [k for k in ref if ref[k] != got[k]]
+    rec("D", "D7", not mism, f"challenge_id 값 변경 후 선택 동일 (불일치 {len(mism)})",
+        "CHALLENGE_RULES.md: challenge_id 는 실행 검증 용도로만 사용")
     shutil.rmtree(work, ignore_errors=True)
+
+
+# ------------------------------------------------------------------ G extras
+# Added after auditing this harness against the full docs set. Two findings drove
+# it: the harness validated the shape of the container's output but never checked
+# the one condition that actually zeroes a tier (cost within budget), and several
+# input shapes the rules explicitly permit were never fed to the container.
+
+CODE_LICENSES = {"Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "0BSD"}
+ADDED_CODE_LICENSES = CODE_LICENSES | {"BSL-1.0", "Zlib"}
+DOC_LICENSES = {"CC-BY-4.0", "CC-BY-SA-4.0"}
+UPSTREAM_RELEASE = "3cccbf60"
+
+
+def _spdx_of(rel: str) -> set[str]:
+    """SPDX ids for a tracked path: inline header first, then REUSE.toml."""
+    ids: set[str] = set()
+    p = ROOT / rel
+    if p.is_file():
+        try:
+            head = p.read_text(encoding="utf-8", errors="replace")[:4000]
+            for raw in re.findall(r"SPDX-License-Identifier:\s*([^\n\r]+)", head):
+                # An earlier version excluded '-' from the value, which silently
+                # truncated every id at the first hyphen: Apache-2.0 became
+                # "Apache" and then failed the allowlist. Take the rest of the
+                # line and drop only the comment terminators.
+                ids.add(raw.replace("-->", " ").replace("*/", " ").strip())
+        except OSError:
+            pass
+    toml = (ROOT / "REUSE.toml")
+    if toml.is_file():
+        text = toml.read_text(encoding="utf-8")
+        for block in text.split("[[annotations]]")[1:]:
+            paths = re.findall(r'"([^"]+)"', block.split("SPDX-FileCopyrightText")[0])
+            lic = re.search(r'SPDX-License-Identifier\s*=\s*"([^"]+)"', block)
+            if not lic:
+                continue
+            for pat in paths:
+                # fnmatch, not a trailing-* prefix test: REUSE.toml patterns put
+                # the wildcard mid-path ("src/.../resources/*.json"), which the
+                # prefix test never matched, so those files looked unlicensed.
+                if pat == rel or fnmatch.fnmatch(rel, pat):
+                    ids.add(lic.group(1))
+    out: set[str] = set()
+    for i in ids:
+        out |= {t for t in re.split(r"\s+(?:AND|OR)\s+|\s+", i.strip()) if t}
+    return out
+
+
+def group_g(image: str | None, have_docker: bool, outs: dict, meta: dict) -> None:
+    print("\nG. 예산·경계·공급망  (SCORING.md / CHALLENGE_RULES.md / RUNTIME.md)")
+
+    # --- G1: the tier-zero condition, on the container's own output ---
+    if outs:
+        from decimal import Decimal
+        from ossp_router.protocol import load_bundled_policy, load_outcomes
+        pol = load_bundled_policy()
+        unit = Decimal(str(pol.token_unit))
+        oc = {}
+        for split in ("train", "dev"):
+            f = ROOT / "data" / split / "outcomes.json"
+            if f.is_file():
+                for o in load_outcomes(f).outcomes:
+                    oc[(o.episode_id, o.model_id)] = o
+        light = pol.light_model_id
+
+        def cost(eid: str, mid: str) -> Decimal:
+            o = oc[(eid, mid)]
+            m = pol.models[mid]
+            return (Decimal(str(o.input_tokens)) * Decimal(str(m.input_token_rate))
+                    + Decimal(str(o.output_tokens)) * Decimal(str(m.output_token_rate))) / unit
+
+        for tier, picks in sorted(outs.items()):
+            try:
+                base = sum((cost(e, light) for e in picks), Decimal(0))
+                spent = sum((cost(e, m) for e, m in picks.items()), Decimal(0))
+                mult = Decimal(str(pol.tiers[tier].budget_multiplier))
+                ok = spent <= base * mult
+                rec("G", f"G1{tier[0]}", ok,
+                    f"{tier}: 실제 비용 {spent / base:.4f} <= 한도 {mult} "
+                    f"(여유 {float(1 - (spent / base) / mult):.1%})",
+                    "SCORING.md: 한도 초과 시 해당 등급 0점")
+            except KeyError as exc:
+                rec("G", f"G1{tier[0]}", None, f"{tier}: outcome 없음 {exc}")
+    else:
+        rec("G", "G1", None, "컨테이너 결과 없음 — 예산 검증 생략")
+
+    # --- G2: reproducible build needs an immutable base ---
+    dockerfile = ROOT / "container" / "Dockerfile"
+    froms = re.findall(r"^FROM\s+(\S+)", dockerfile.read_text(encoding="utf-8"), re.M) \
+        if dockerfile.is_file() else []
+    pinned = bool(froms) and all("@sha256:" in f for f in froms)
+    rec("G", "G2", pinned, f"기반 이미지가 다이제스트로 고정 ({[f[-19:] for f in froms]})",
+        "CHALLENGE_RULES.md: 제출 커밋에서 재현 가능하게 빌드")
+
+    # --- G3: licences of everything the participant added ---
+    added = [p for p in git("diff", "--name-only", f"{UPSTREAM_RELEASE}..HEAD").splitlines()
+             if p.strip()]
+    bad = []
+    for rel in added:
+        if not (ROOT / rel).is_file():
+            continue
+        ids = _spdx_of(rel)
+        allowed = ADDED_CODE_LICENSES | (DOC_LICENSES if rel.endswith((".md", ".json"))
+                                         else set())
+        if not ids or not ids <= allowed:
+            bad.append(f"{rel}:{sorted(ids) or 'none'}")
+    rec("G", "G3", not bad,
+        f"참가자 추가 {len(added)}개 파일의 SPDX 가 허용목록 내 ({len(bad)}건 위반)"
+        + (f" {bad[:4]}" if bad else ""),
+        "CHALLENGE_RULES.md: 추가 코드는 허용 목록 + BSL-1.0, Zlib")
+
+    # --- G4: the metadata file must arrive as its own commit ---
+    c = git("log", "-1", "--format=%H", "--", "submission-ossp-skt.json")
+    files = git("show", "--pretty=", "--name-only", c).split() if c else []
+    rec("G", "G4", files == ["submission-ossp-skt.json"],
+        f"submission-ossp-skt.json 이 단독 커밋 {c[:8]} 으로 기록 ({files})",
+        "SUBMISSION.md: 이 파일만 담은 커밋을 따로 만든다")
+
+    # --- G5: a judge with no credentials has to be able to open all of it ---
+    url = str(meta.get("repository_url", "")).rstrip("/")
+    sha = str(meta.get("commit_sha", ""))
+    m = re.search(r"github\.com/([^/]+)/([^/]+)", url)
+    if m and sha:
+        owner, repo = m.group(1), m.group(2)
+        api = _anon_get(f"https://api.github.com/repos/{owner}/{repo}")
+        raw = _anon_status(f"https://raw.githubusercontent.com/{owner}/{repo}/"
+                           f"{sha}/submission-ossp-skt.json")
+        tree = _anon_status(f"{url}/tree/{sha}")
+        if api is None:
+            rec("G", "G5", None, "네트워크 없음 — 익명 접근 검증 생략")
+        else:
+            ok = (api.get("private") is False and api.get("fork") is True
+                  and api.get("archived") is False and raw == 200 and tree == 200)
+            rec("G", "G5", ok,
+                f"익명 접근: private={api.get('private')} fork={api.get('fork')} "
+                f"archived={api.get('archived')} tree={tree} raw-json={raw}",
+                "CHALLENGE_RULES.md: 공식 저장소 fork, 심사 종료까지 별도 권한 없이 공개")
+    else:
+        rec("G", "G5", None, "repository_url 파싱 불가 — 익명 접근 검증 생략")
+
+    # --- G6: no private supply chain ---
+    supply = ["container/Dockerfile", "pyproject.toml", ".gitmodules",
+              "baselines/requirements-train.txt"]
+    hits = []
+    for rel in supply:
+        p = ROOT / rel
+        if not p.is_file():
+            continue
+        t = p.read_text(encoding="utf-8", errors="replace")
+        for pat in (r"--index-url", r"--extra-index-url", r"git\+ssh", r"git@github\.com",
+                    r"Authorization", r"[?&]token="):
+            if re.search(pat, t):
+                hits.append(f"{rel}:{pat}")
+    rec("G", "G6", not hits, f"비공개 공급망 참조 없음 ({hits})",
+        "CHALLENGE_RULES.md: 비공개 submodule·패키지·다운로드 경로 금지")
+
+    # --- G7: nothing outcome-shaped inside the image ---
+    if have_docker and image:
+        # Scoped to /opt/router: that is the only path the participant controls.
+        # Searching the whole filesystem matched the pinned base image's CA bundle
+        # (a certificate named "..._Class_Gold_..." hits '*gold*'), which is a
+        # false positive about SKT's own base image, not about this entry.
+        r = sh(["docker", "run", "--rm", "--platform", "linux/arm64", "--entrypoint", "sh",
+                image, "-c",
+                r"find /opt/router -type f \( -iname '*outcome*' -o -iname '*answer*' "
+                r"-o -iname '*gold*' -o -iname '*solution*' -o -iname '*label*' "
+                r"-o -iname '*.ipynb' \) 2>/dev/null | head -20"])
+        found = [x for x in r.stdout.split() if x.strip()]
+        rec("G", "G7", not found,
+            f"/opt/router 에 정답·평가결과 형태 파일 없음 ({found[:5]})",
+            "ENFORCEMENT.md: 비공개 평가 자료·결과 사용 금지")
+    else:
+        rec("G", "G7", None, "docker 없음 — 이미지 내용 검사 생략")
+
+    # --- G8: this harness must not run the container more loosely than the operator ---
+    rt = (ROOT / "src" / "ossp_router" / "runtime.py")
+    if rt.is_file():
+        text = rt.read_text(encoding="utf-8")
+        required = ["--network", "--read-only", "--cap-drop", "--security-opt",
+                    "--ipc", "--cgroupns", "--ulimit", "--pids-limit",
+                    "--memory-swap", "--log-driver", "--tmpfs"]
+        official = [f for f in required if f'"{f}"' in text]
+        missing = [f for f in official if f not in RUN_FLAGS]
+        rec("G", "G8", not missing,
+            f"하네스 실행 플래그가 운영자 규격을 포함 (운영자 {len(official)}개 중 누락 {missing})",
+            "RUNTIME.md: 평가와 같은 격리 조건에서 검증해야 의미가 있음")
+
+    # --- G9/G10: input shapes the rules permit but the public data never contains ---
+    if have_docker and image:
+        from ossp_router.protocol import parse_submission
+        work = Path(tempfile.mkdtemp(prefix="ossp-edge-"))
+        long_id = "e" + "".join("abcdefghijklmnopqrstuvwxyz0123456789_-"[i % 38]
+                                for i in range(127))
+        eps = [
+            {"episode_id": "over-limit", "prompt": "token " * 45000},
+            {"episode_id": long_id, "prompt": "Compute 2+2 and explain."},
+            {"episode_id": "roles", "messages": [
+                {"role": "system", "content": "You are terse."},
+                {"role": "user", "content": "Sort [3,1,2]."},
+                {"role": "assistant", "content": "Let me think step by step."}]},
+        ]
+        _write_input(work / "edge" / "inputs.json", eps)
+        r, _ = _run_container(image, work / "edge", "ossp-edge-a", "fast")
+        _, body = _read_out_volume("ossp-edge-a")
+        sh(["docker", "volume", "rm", "-f", "ossp-edge-a"])
+        try:
+            got = {d.episode_id: d.model_id for d in parse_submission(json.loads(body)).decisions}
+            ok = (r.returncode == 0 and set(got) == {"over-limit", long_id, "roles"}
+                  and all(v in MODELS for v in got.values()))
+            rec("G", "G9", ok,
+                f"32K 초과 프롬프트·128자 episode_id·assistant 역할 처리 "
+                f"(exit {r.returncode}, {len(got)}개 결정)",
+                "CHALLENGE_RULES.md: 라우터가 context_limit 을 입력 제한으로 재적용하면 안 됨")
+        except Exception as exc:
+            rec("G", "G9", False, f"경계 입력 처리 실패 (exit {r.returncode}) {exc}")
+
+        _write_input(work / "one" / "inputs.json",
+                     [{"episode_id": "solo", "prompt": "What is the capital of France?"}])
+        r, _ = _run_container(image, work / "one", "ossp-edge-b", "balanced")
+        _, body = _read_out_volume("ossp-edge-b")
+        sh(["docker", "volume", "rm", "-f", "ossp-edge-b"])
+        try:
+            subs = parse_submission(json.loads(body)).decisions
+            rec("G", "G10", r.returncode == 0 and len(subs) == 1
+                and subs[0].episode_id == "solo",
+                f"문항 1개 배치 처리 (exit {r.returncode}, {len(subs)}개 결정)",
+                "CHALLENGE_RULES.md: episodes 는 최소 1개")
+        except Exception as exc:
+            rec("G", "G10", False, f"단일 문항 배치 실패 (exit {r.returncode}) {exc}")
+        shutil.rmtree(work, ignore_errors=True)
+    else:
+        rec("G", "G9", None, "docker 없음 — 경계 입력 검사 생략")
 
 
 def main() -> int:
@@ -510,11 +821,16 @@ def main() -> int:
         group_d(args.image, have_docker, base)
     group_e()
     group_f()
+    group_g(args.image, have_docker, base, meta)
 
     print("\n" + "=" * 78)
     fails = [r for r in RESULTS if r[2] == "FAIL"]
     skips = [r for r in RESULTS if r[2] == "SKIP"]
-    dq = [r for r in fails if r[0] in ("A", "D", "E")]
+    # G mixes both classes: the budget and boundary checks cost a tier, the
+    # licence, public-access and supply-chain ones end the whole entry.
+    TIER_ONLY = {"G1f", "G1b", "G1p", "G1", "G9", "G10"}
+    dq = [r for r in fails if r[0] in ("A", "D", "E")
+          or (r[0] == "G" and r[1] not in TIER_ONLY)]
     print(f"총 {len(RESULTS)}개 검사 · PASS {len(RESULTS)-len(fails)-len(skips)} · "
           f"FAIL {len(fails)} · SKIP {len(skips)}")
     if dq:
